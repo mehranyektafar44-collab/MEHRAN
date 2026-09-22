@@ -6,7 +6,7 @@
 //|   v1.10 - strict 3-candle FVG, swing-after-sweep BOS, debug.    |
 //+------------------------------------------------------------------+
 #property copyright "Rule-exact implementation"
-#property version   "1.10"
+#property version   "1.11"
 #property strict
 
 //============================ INPUTS ==============================
@@ -103,6 +103,7 @@ double   g_lastRR    = 0.0;    // last signal RR
 datetime g_lastM5Bar= 0;
 datetime g_curDay   = 0;
 string   g_sigText  = "(none)";
+string   g_blockReason = "(none)";
 
 //============================ INIT ================================
 int OnInit()
@@ -408,7 +409,7 @@ void TryDetectBullBOS()
 {
    double lvl; int hidx=FindSwingHighAfterSweep(PERIOD_M5,BOS_HalfWidth,SweepSearchBars,lvl);
    if(hidx<0) return;
-   if(iClose(Sym,PERIOD_M5,1)>lvl && iClose(Sym,PERIOD_M5,2)<=lvl)   // completed-candle close above
+   if(iClose(Sym,PERIOD_M5,1)>lvl)   // completed-candle close above; crossing may have occurred on an earlier bar within the BOS window
    {
       g_bosLvl=lvl; g_bosTime=iTime(Sym,PERIOD_M5,1);
       g_fvgValid=false; g_fvgUpper=0; g_fvgLower=0; g_fvgTime=0;
@@ -422,7 +423,7 @@ void TryDetectBearBOS()
 {
    double lvl; int lidx=FindSwingLowAfterSweep(PERIOD_M5,BOS_HalfWidth,SweepSearchBars,lvl);
    if(lidx<0) return;
-   if(iClose(Sym,PERIOD_M5,1)<lvl && iClose(Sym,PERIOD_M5,2)>=lvl)   // completed-candle close below
+   if(iClose(Sym,PERIOD_M5,1)<lvl)   // completed-candle close below; crossing may have occurred on an earlier bar within the BOS window
    {
       g_bosLvl=lvl; g_bosTime=iTime(Sym,PERIOD_M5,1);
       g_fvgValid=false; g_fvgUpper=0; g_fvgLower=0; g_fvgTime=0;
@@ -476,22 +477,22 @@ void HandlePullbackWait(int dir)
 void EvaluateSetup()
 {
    int trend=M15Trend();
-   if(g_state!=ST_IDLE && trend!=g_dir){ ResetSetup(); return; }
+   if(g_state!=ST_IDLE && trend!=g_dir){ g_blockReason="M15_TREND_FLIP"; ResetSetup(); return; }
    if(g_state!=ST_IDLE) g_stateBars++;
 
    if(g_state==ST_IDLE && trend!=0)
    { g_phase="IDLE"; if(trend>0) TryDetectBuySweep(); else TryDetectSellSweep(); }
    else if(g_state==ST_BOS_WAIT)
    { g_phase="BOS_WAIT";
-     if(g_stateBars>SweepValidBars+BOS_ValidBars){ ResetSetup(); return; }
+     if(g_stateBars>SweepValidBars+BOS_ValidBars){ g_blockReason="BOS_TIMEOUT"; ResetSetup(); return; }
      if(g_dir>0) TryDetectBullBOS(); else TryDetectBearBOS(); }
    else if(g_state==ST_PULLBACK_WAIT)
    { g_phase="PULLBACK_WAIT";
-     if(g_stateBars>BOS_ValidBars+Pullback_ValidBars){ ResetSetup(); return; }
+     if(g_stateBars>BOS_ValidBars+Pullback_ValidBars){ g_blockReason="PULLBACK_TIMEOUT"; ResetSetup(); return; }
      HandlePullbackWait(g_dir); }
    else if(g_state==ST_CONFIRM_WAIT)
    { g_phase="CONFIRMATION_WAIT";
-     if(g_stateBars>BOS_ValidBars+2*Pullback_ValidBars){ ResetSetup(); return; }
+     if(g_stateBars>BOS_ValidBars+2*Pullback_ValidBars){ g_blockReason="CONFIRMATION_TIMEOUT"; ResetSetup(); return; }
      HandleConfirmWait(g_dir); }
 }
 
@@ -500,28 +501,32 @@ void FireSignal(int dir)
 {
    double atr=ATRv(PERIOD_M5,ATR_Period,1);
    double aatr=AvgATR(PERIOD_M5,ATR_Period,ATR_AvgPeriod);
-   if(aatr>0 && atr<ATR_Threshold*aatr){ ResetSetup(); return; }        // ATR filter
+   if(aatr>0 && atr<ATR_Threshold*aatr){ g_blockReason="ATR"; ResetSetup(); return; }
    double rsi=RSIv(1);
-   if(dir>0 && !(rsi>RSI_Level)){ ResetSetup(); return; }               // RSI filter
-   if(dir<0 && !(rsi<RSI_Level)){ ResetSetup(); return; }
+   if(dir>0 && !(rsi>RSI_Level)){ g_blockReason="RSI_BUY"; ResetSetup(); return; }
+   if(dir<0 && !(rsi<RSI_Level)){ g_blockReason="RSI_SELL"; ResetSetup(); return; }
    double vwap=(UseVWAPFilter? SessionVWAP():0);
    double px=(dir>0? MarketInfo(Sym,MODE_ASK):MarketInfo(Sym,MODE_BID));
    if(UseVWAPFilter && vwap>0)
-   { if(dir>0 && !(px>vwap)){ ResetSetup(); return; }
-     if(dir<0 && !(px<vwap)){ ResetSetup(); return; } }
-   if(!InSession()){ ResetSetup(); return; }                            // session
-   if(CurrentSpreadPoints()>MaxAllowedSpread){ ResetSetup(); return; }   // spread
-   if(OpenTrades()>=MaxOpenTrades){ ResetSetup(); return; }             // limits
-   if(TradesToday()>=MaxTradesPerDay){ ResetSetup(); return; }
-   if(ConsecLosses()>=MaxConsecLosses){ ResetSetup(); return; }
+   {
+      if(dir>0 && !(px>vwap)){ g_blockReason="VWAP_BUY"; ResetSetup(); return; }
+      if(dir<0 && !(px<vwap)){ g_blockReason="VWAP_SELL"; ResetSetup(); return; }
+   }
+   if(!InSession()){ g_blockReason="SESSION"; ResetSetup(); return; }
+   if(CurrentSpreadPoints()>MaxAllowedSpread){ g_blockReason="SPREAD"; ResetSetup(); return; }
+   if(OpenTrades()>=MaxOpenTrades){ g_blockReason="OPEN_TRADES_LIMIT"; ResetSetup(); return; }
+   if(TradesToday()>=MaxTradesPerDay){ g_blockReason="DAILY_TRADE_LIMIT"; ResetSetup(); return; }
+   if(ConsecLosses()>=MaxConsecLosses){ g_blockReason="CONSEC_LOSS_LIMIT"; ResetSetup(); return; }
 
    double entry=px, sl, tp, risk;
    if(dir>0){ sl=g_sweepLvl-atr*SL_ATR_Buffer; risk=entry-sl; }
    else     { sl=g_sweepLvl+atr*SL_ATR_Buffer; risk=sl-entry; }
-   if(risk<SL_Min_ATR*atr || risk>SL_Max_ATR*atr){ ResetSetup(); return; } // SL range
+   if(risk<SL_Min_ATR*atr){ g_blockReason="SL_TOO_TIGHT"; ResetSetup(); return; }
+   if(risk>SL_Max_ATR*atr){ g_blockReason="SL_TOO_WIDE"; ResetSetup(); return; }
    tp=(dir>0? entry+risk*TP_R_Multiple : entry-risk*TP_R_Multiple);
 
    g_lastSLdist=risk; g_lastRR=TP_R_Multiple; g_phase="SIGNAL";
+   g_blockReason="SIGNAL_READY";
    BuildSignalGraphics(dir,entry,sl,tp,TP_R_Multiple,atr,rsi,vwap);
    if(!SignalOnly) ExecuteTrade(dir,sl,tp,risk);
    ResetSetup();
@@ -637,8 +642,8 @@ void UpdateStatus()
 {
    if(!DebugMode)
    {
-      Comment(StringFormat("XAU Sweep+BOS Scalper [%s]  Mode:%s  State:%s\nLast Signal: %s",
-              Sym,(SignalOnly?"SIGNAL-ONLY":"LIVE"),g_phase,g_sigText));
+      Comment(StringFormat("XAU Sweep+BOS Scalper [%s]  Mode:%s  State:%s\nLast Signal: %s\nLast Block: %s",
+              Sym,(SignalOnly?"SIGNAL-ONLY":"LIVE"),g_phase,g_sigText,g_blockReason));
       return;
    }
    int tr=M15Trend(); string trS=(tr>0?"BULLISH":tr<0?"BEARISH":"UNCLEAR");
@@ -654,7 +659,7 @@ void UpdateStatus()
      fvgS,fvgSize,MinFVG_ATR_Fraction*atr,
      sess,CurrentSpreadPoints(),MaxAllowedSpread,
      atr,aatr,ATR_Threshold*aatr,rsi,vw,(UseVWAPFilter?"on":"off"),
-     g_lastSLdist,g_lastRR,TradesToday(),MaxTradesPerDay,ConsecLosses(),MaxConsecLosses,g_sigText));
+     g_lastSLdist,g_lastRR,TradesToday(),MaxTradesPerDay,ConsecLosses(),MaxConsecLosses,g_sigText,g_blockReason));
 }
 
 //===================== MAIN TICK ==============================
